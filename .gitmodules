@@ -1,3 +1,6 @@
 [submodule "ostep-code"]
 	path = ostep-code
 	url = https://github.com/remzi-arpacidusseau/ostep-code.git
+[submodule "xv6-riscv"]
+	path = xv6-riscv
+	url = https://github.com/mit-pdos/xv6-riscv.git
