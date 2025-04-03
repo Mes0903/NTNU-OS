@@ -1,0 +1,69 @@
+diff --git a/Makefile b/Makefile
+index f8c820e..146f528 100644
+--- a/Makefile
++++ b/Makefile
+@@ -139,6 +139,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_sleep\
++	$U/_osleep\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/user/sh.c b/user/sh.c
+index 836ebcb..7e25219 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -124,8 +124,49 @@ runcmd(struct cmd *cmd)
+ 
+   case BACK:
+     bcmd = (struct backcmd*)cmd;
+-    if(fork1() == 0)
+-      runcmd(bcmd->cmd);
++    /* original code */
++    // if(fork1() == 0)
++    //   runcmd(bcmd->cmd);
++    /* end original code */
++    if(fork1() == 0) {
++      // Double-fork to run the actual background command.
++      int bgpid = fork1();
++      if(bgpid == 0) {
++        // Grandchild: execute the actual background job.
++        runcmd(bcmd->cmd);  
++        exit(0);
++      }
++      
++      // Reaper child: wait for the grandchild (the real bg job).
++      wait(0);
++
++      // Now the background command has finished. Print the done message:
++      // We know the PID was 'bgpid'.
++      // For the NAME, we just re-print the first argument of bcmd->cmd (common approach).
++      // If bcmd->cmd is an execcmd, we can cast and read its argv[0].
++      int silent = 0;
++      char *progname = 0;
++      if(bcmd->cmd->type == EXEC) {
++        struct execcmd *ec = (struct execcmd*)bcmd->cmd;
++        if(ec->argv[0]) {
++          progname = ec->argv[0];
++
++          if(strcmp(progname, "osleep") == 0) {
++            // Looking for -s
++            for(int i = 1; ec->argv[i] != 0; i++){
++              if(strcmp(ec->argv[i], "-s") == 0){
++                silent = 1;
++                break;
++              }
++            }
++          }
++        }
++      }
++
++      if(!silent)
++        printf("%d Done %s\n", bgpid, progname);
++    }
++
+     break;
+   }
+   exit(0);
