@@ -1,0 +1,234 @@
+diff --git a/Makefile b/Makefile
+index f8c820e..4845115 100644
+--- a/Makefile
++++ b/Makefile
+@@ -139,6 +139,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_ileak\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/fs.c b/kernel/fs.c
+index c6bab15..692dd9e 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -44,6 +44,12 @@ fsinit(int dev) {
+   if(sb.magic != FSMAGIC)
+     panic("invalid file system");
+   initlog(dev, &sb);
++
++  begin_op();
++  cleanup_orphans();
++  end_op();
++  
++  printf("fsinit: file system recovery complete\n");
+ }
+ 
+ // Zero a block.
+@@ -356,6 +362,12 @@ iput(struct inode *ip)
+ 
+     acquire(&itable.lock);
+   }
++  else if(ip->ref == 1 && ip->valid && ip->nlink == 0) {
++    // This case shouldn't happen with the logic above, but let's be safe
++    release(&itable.lock);
++    add_orphan(ip->inum);
++    acquire(&itable.lock);
++  }
+ 
+   ip->ref--;
+   release(&itable.lock);
+@@ -695,3 +707,126 @@ nameiparent(char *path, char *name)
+ {
+   return namex(path, 1, name);
+ }
++
++// Add an inode to the orphan list when its link count drops to 0
++// but reference count is still > 0
++void
++add_orphan(uint inum)
++{
++  struct buf *bp;
++  struct superblock *sb;
++  
++  bp = bread(ROOTDEV, 1);  // Read superblock
++  sb = (struct superblock*)bp->data;
++  
++  // Check if we have space in the orphan list
++  if(sb->norphans >= MAXORPHANS) {
++    printf("add_orphan: orphan list full, cannot add inode %d\n", inum);
++    brelse(bp);
++    return;
++  }
++  
++  // Check if inode is already in the list
++  for(int i = 0; i < sb->norphans; i++) {
++    if(sb->orphans[i] == inum) {
++      brelse(bp);
++      return;  // Already in list
++    }
++  }
++  
++  // Add to orphan list
++  sb->orphans[sb->norphans++] = inum;
++  
++  log_write(bp);  // Mark for logging
++  brelse(bp);
++  
++  printf("add_orphan: added inode %d to orphan list (%d total)\n", inum, sb->norphans);
++}
++
++// Remove an inode from the orphan list when it's properly freed
++void
++remove_orphan(uint inum)
++{
++  struct buf *bp;
++  struct superblock *sb;
++  int found = -1;
++  
++  bp = bread(ROOTDEV, 1);  // Read superblock
++  sb = (struct superblock*)bp->data;
++  
++  // Find the inode in the orphan list
++  for(int i = 0; i < sb->norphans; i++) {
++    if(sb->orphans[i] == inum) {
++      found = i;
++      break;
++    }
++  }
++  
++  if(found == -1) {
++    brelse(bp);
++    return;  // Not in list
++  }
++  
++  // Remove by shifting remaining entries
++  for(int i = found; i < sb->norphans - 1; i++) {
++    sb->orphans[i] = sb->orphans[i + 1];
++  }
++  sb->norphans--;
++  
++  log_write(bp);  // Mark for logging
++  brelse(bp);
++  
++  printf("remove_orphan: removed inode %d from orphan list (%d remaining)\n", inum, sb->norphans);
++}
++
++// Clean up all orphaned inodes (called during recovery)
++void
++cleanup_orphans(void)
++{
++  struct buf *bp;
++  struct superblock *sb;
++  struct inode *ip;
++  uint inum;
++  int cleaned = 0;
++  
++  bp = bread(ROOTDEV, 1);  // Read superblock
++  sb = (struct superblock*)bp->data;
++  
++  printf("cleanup_orphans: found %d orphaned inodes to clean\n", sb->norphans);
++  
++  // Process each orphaned inode
++  for(int i = 0; i < sb->norphans; i++) {
++    inum = sb->orphans[i];
++    
++    printf("cleanup_orphans: processing orphaned inode %d\n", inum);
++    
++    // Get the inode
++    ip = iget(ROOTDEV, inum);
++    ilock(ip);
++    
++    // Verify it's actually orphaned (nlink == 0)
++    if(ip->nlink == 0) {
++      printf("cleanup_orphans: freeing orphaned inode %d (size=%d)\n", inum, ip->size);
++      
++      // Free the inode's data blocks
++      itrunc(ip);
++      
++      // Mark inode as free
++      ip->type = 0;
++      iupdate(ip);
++      
++      cleaned++;
++    } else {
++      printf("cleanup_orphans: inode %d has nlink=%d, not orphaned\n", inum, ip->nlink);
++    }
++    
++    iunlockput(ip);
++  }
++  
++  // Clear the orphan list
++  sb->norphans = 0;
++  log_write(bp);
++  brelse(bp);
++  
++  printf("cleanup_orphans: cleaned %d orphaned inodes\n", cleaned);
++}
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..6c05171 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -4,6 +4,7 @@
+ 
+ #define ROOTINO  1   // root i-number
+ #define BSIZE 1024  // block size
++#define MAXORPHANS 10
+ 
+ // Disk layout:
+ // [ boot block | super block | log | inode blocks |
+@@ -20,6 +21,10 @@ struct superblock {
+   uint logstart;     // Block number of first log block
+   uint inodestart;   // Block number of first inode block
+   uint bmapstart;    // Block number of first free map block
++
++  // New fields for orphaned inode tracking
++  uint norphans;     // Number of orphaned inodes
++  uint orphans[MAXORPHANS]; // Array of orphaned inode numbers
+ };
+ 
+ #define FSMAGIC 0x10203040
+@@ -58,3 +63,6 @@ struct dirent {
+   char name[DIRSIZ];
+ };
+ 
++void add_orphan(uint inum);
++void remove_orphan(uint inum);
++void cleanup_orphans(void);
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 16b668c..dbe953b 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -230,6 +230,13 @@ sys_unlink(void)
+ 
+   ip->nlink--;
+   iupdate(ip);
++
++  // If nlink becomes 0 but inode still has references, add it to the orphan list
++  if(ip->nlink == 0 && ip->ref > 1) {
++    add_orphan(ip->inum);
++    printf("sys_unlink: inode %d orphaned (ref=%d)\n", ip->inum, ip->ref);
++  }
++
+   iunlockput(ip);
+ 
+   end_op();
+diff --git a/mkfs/mkfs.c b/mkfs/mkfs.c
+index f39983d..5a6b72c 100644
+--- a/mkfs/mkfs.c
++++ b/mkfs/mkfs.c
+@@ -102,6 +102,12 @@ main(int argc, char *argv[])
+   sb.inodestart = xint(2+nlog);
+   sb.bmapstart = xint(2+nlog+ninodeblocks);
+ 
++  // Initialize orphan tracking fields
++  sb.norphans = xint(0);
++  for(int i = 0; i < MAXORPHANS; i++) {
++    sb.orphans[i] = xint(0);
++  }
++
+   printf("nmeta %d (boot, super, log blocks %u inode blocks %u, bitmap blocks %u) blocks %d total %d\n",
+          nmeta, nlog, ninodeblocks, nbitmap, nblocks, FSSIZE);
+ 
